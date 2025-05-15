@@ -28,7 +28,7 @@ import reactor.core.publisher.Mono;
 
 @Service
 @Slf4j
-@RequiredArgsConstructor // Lombok
+@RequiredArgsConstructor
 public class OrderServiceImpl implements OrderService {
 
   private final OrderRepository orderRepository;
@@ -41,9 +41,7 @@ public class OrderServiceImpl implements OrderService {
     return orderRepository.findById(orderId)
         .switchIfEmpty(Mono.error(new RuntimeException("Order not found with id: " + orderId)))
         .flatMap(
-            order -> orderItemRepository.findByOrdersId(order.getId()).collectList().map(items -> {
-              return order;
-            }));
+            order -> orderItemRepository.findByOrdersId(order.getId()).collectList().map(items -> order));
   }
 
   @Override
@@ -64,7 +62,7 @@ public class OrderServiceImpl implements OrderService {
             return Mono.error(
                 new RuntimeException("One or more products not found. Missing IDs: " + missingIds));
           }
-          // Validar stock preliminar (opcional, la validación real es al confirmar)
+          // Validar stock preliminar
           for (OrderItemRequest itemReq : request.getItems()) {
             Product p = foundProducts.get(itemReq.getProductId());
             if (p.getStock() < itemReq.getQuantity()) {
@@ -90,27 +88,23 @@ public class OrderServiceImpl implements OrderService {
   }
 
   public Mono<Order> confirmOrder(Long orderId) {
-    // ¡¡Esta es la operación CRÍTICA y necesita transacción!!
-    return transactionalOperator.execute(status -> // Inicia la transacción reactiva
+    return transactionalOperator.execute(status ->
     orderRepository.findById(orderId)
-        .switchIfEmpty(Mono.error(new RuntimeException("Order not found: " + orderId))) // Excepción
-        // específica
-        .filter(p -> "PENDIENTE".equals(p.getState())) // Solo confirmar pendientes
+        .switchIfEmpty(Mono.error(new RuntimeException("Order not found: " + orderId)))
+        .filter(p -> "PENDIENTE".equals(p.getState()))
         .switchIfEmpty(
             Mono.error(new RuntimeException("Order is not in PENDING state: " + orderId)))
         .flatMap(
             order -> orderItemRepository.findByOrdersId(orderId).collectList().flatMap(items -> {
               if (items.isEmpty()) {
-                status.setRollbackOnly(); // Marcar para rollback
+                status.setRollbackOnly();
                 return Mono.error(new RuntimeException("Order has no items: " + orderId));
               }
               List<Long> productIds = items.stream().map(OrderItem::getProductId)
                   .collect(Collectors.toList());
 
-              // 4. Obtener Products involucrados CON su versión actual
               return productRepository.findByIdIn(productIds).collectMap(Product::getId)
                   .flatMap(productsMap -> {
-                    // Validar que todos los productos de los items existen en el mapa
                     for (OrderItem item : items) {
                       if (!productsMap.containsKey(item.getProductId())) {
                         status.setRollbackOnly();
@@ -120,7 +114,6 @@ public class OrderServiceImpl implements OrderService {
                       }
                     }
 
-                    // 5. Validar stock ACTUAL y calcular total bruto
                     double totalGross = 0.0;
                     for (OrderItem item : items) {
                       Product product = productsMap.get(item.getProductId());
@@ -128,19 +121,15 @@ public class OrderServiceImpl implements OrderService {
                       if (product.getStock() < item.getQuantity()) {
                         status.setRollbackOnly(); // Marcar para rollback
                         return Mono.error(new RuntimeException(
-                            "Final insufficient stock for product ID: " + product.getId())); // Excepción
-                        // específica
+                            "Final insufficient stock for product ID: " + product.getId()));
                       }
-                      // Usar precio guardado en OrderItem para el cálculo
                       totalGross += item.getUnitPrice() * item.getQuantity();
                     }
 
-                    // 6. Calcular Descuentos
                     double discountRate = 0.0;
                     if (totalGross > 1000.0) {
                       discountRate += 0.10;
                     }
-                    // Contar products diferentes
                     long uniqueProducts = items.stream().map(OrderItem::getProductId).distinct()
                         .count();
                     if (uniqueProducts > 5) {
@@ -148,27 +137,22 @@ public class OrderServiceImpl implements OrderService {
                     }
                     double totalFinal = totalGross * (1.0 - discountRate);
 
-// Dentro de confirmOrder, antes del Flux<Integer> updateStockFlux = ...
-
-// Agrupar items por productId y sumar cantidades
                     Map<Long, Integer> totalQuantityPerProduct = items.stream()
                         .collect(Collectors.groupingBy(OrderItem::getProductId,
                             Collectors.summingInt(OrderItem::getQuantity)));
 
-// Luego, itera sobre este mapa para actualizar el stock una vez por producto
                     Flux<Integer> updateStockFlux = Flux
                         .fromIterable(totalQuantityPerProduct.entrySet()).concatMap(entry -> {
                           Long productId = entry.getKey();
                           Integer totalQuantityToDecrement = entry.getValue();
-                          Product p = productsMap.get(productId); // Obtener el producto
+                          Product p = productsMap.get(productId);
 
-                          if (p == null) { // Seguridad adicional, aunque ya validaste productsMap
+                          if (p == null) {
                             status.setRollbackOnly();
                             return Mono.error(new RuntimeException(
                                 "Product not found in map during stock update: " + productId));
                           }
-                          if (p.getStock() < totalQuantityToDecrement) { // Re-chequear stock con la
-                                                                         // cantidad total
+                          if (p.getStock() < totalQuantityToDecrement) {
                             status.setRollbackOnly();
                             return Mono.error(new RuntimeException(
                                 "Final insufficient stock (grouped) for product ID: " + p.getId()));
@@ -185,22 +169,17 @@ public class OrderServiceImpl implements OrderService {
                               p.getVersion());
                         });
 
-                    // 8. Actualizar Order (estado, totales)
                     order.setTotalGross(totalGross);
                     order.setTotalFinal(totalFinal);
-                    order.setState("CONFIRMADO"); // Usar Enum EstadoOrder.CONFIRMADO
+                    order.setState("CONFIRMADO");
 
-                    // Ejecutar actualizaciones de stock y LUEGO guardar el order
-                    // Si updateStockFlux emite un error (ej. por switchIfEmpty), la transacción
-                    // hará rollback.
                     return updateStockFlux.collectList().then(orderRepository.save(order));
                   });
             })))
-        .single()
-        .onErrorMap(ex -> {
+        .single().onErrorMap(ex -> {
           System.err.println(
               "Error confirming order, transaction will be rolled back: " + ex.getMessage());
-          return ex; // Re-lanzar la excepción para que GlobalExceptionHandler la maneje
+          return ex;
         });
   }
 
